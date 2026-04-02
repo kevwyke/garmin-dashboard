@@ -1,0 +1,8 @@
+venv/
+*.pkl
+garmin_session.pkl
+__pycache__/
+.garth/
+dashboard.html
+*.pyc
+
