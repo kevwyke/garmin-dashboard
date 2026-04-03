@@ -229,7 +229,11 @@ def generate_html(sleep, training, vo2max):
                       sleep.get("lightSleepSeconds", 0) +
                       sleep.get("remSleepSeconds", 0))
         total_dur = format_duration(total_secs)
-        respiration = sleep.get("averageRespiration", "—")
+        respiration = (
+            sleep.get("averageRespirationValue")
+            or sleep.get("averageRespiration")
+            or "—"
+        )
         feedback = sleep_scores.get("feedback", "").replace("_", " ").title()
         insight = sleep_scores.get("insight", "").replace("_", " ").title()
         
