@@ -2,6 +2,10 @@ import json
 import os
 import glob
 from datetime import date, datetime, timedelta
+from tracemalloc import start
+import garth
+from garminconnect import Garmin
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -9,6 +13,7 @@ DATA_WELLNESS  = "data-wellness"
 DATA_METRICS   = "data-metrics"
 DATA_FITNESS   = "data-fitness"
 OUTPUT_FILE    = "dashboard.html"
+TOKENSTORE = os.path.expanduser("~/.garth")
 
 WEEKLY_SCHEDULE = {
     0: "Circuit training",   # Monday
@@ -18,6 +23,25 @@ WEEKLY_SCHEDULE = {
     4: "Swim",               # Friday
     5: None,                 # Saturday
     6: None,                 # Sunday
+}
+
+TRAINING_STATUS_MAP = {
+    0: "No Status",
+    1: "Not Enough Data",
+    2: "Recovery",
+    3: "Unproductive",
+    4: "Maintaining",
+    5: "Productive",
+    6: "Peaking",
+    7: "Overreaching",
+    8: "Tapering"
+}
+
+FITNESS_TREND_MAP = {
+    0: "No Trend",
+    1: "Decreasing",
+    2: "Maintaining",
+    3: "Increasing"
 }
 
 # ── Data loading ──────────────────────────────────────────────────────────────
@@ -53,6 +77,42 @@ def get_records_last_n_days(records, n=7, date_field="calendarDate"):
     cutoff = (date.today() - timedelta(days=n)).isoformat()
     return [r for r in records if r.get(date_field, "") >= cutoff]
 
+def get_live_data(today, yesterday):
+    """Fetch live data from Garmin Connect API."""
+    print("Connecting to Garmin...")
+    
+    try:
+        garmin = Garmin()
+        garmin.client.load(TOKENSTORE)
+        garmin.client.cs.impersonate = "chrome131"
+        print("Connected using saved tokens.\n")
+        garmin.display_name = garmin.get_full_name()
+
+    except Exception as e:
+        print(f"Could not connect to Garmin API: {e}")
+        print("Falling back to export data.\n")
+        return None
+
+    data = {}
+
+    fetches = [
+        ("sleep",            lambda: garmin.get_sleep_data(yesterday)),
+        ("body_battery",     lambda: garmin.get_body_battery(today)),
+        ("training_status",  lambda: garmin.get_training_status(today)),
+        ("rhr",              lambda: garmin.get_rhr_day(today)),
+        ("stats",            lambda: garmin.get_stats(today)),
+    ]
+
+    for name, fn in fetches:
+        try:
+            print(f"  Fetching {name}...")
+            data[name] = fn()
+        except Exception as e:
+            print(f"  Could not fetch {name}: {e}")
+            data[name] = None
+
+    return data
+
 # ── Readiness scoring ─────────────────────────────────────────────────────────
 
 def score_readiness(sleep, training):
@@ -65,24 +125,37 @@ def score_readiness(sleep, training):
 
     # Sleep score component (max 40 points impact)
     if sleep:
-        overall = sleep.get("sleepScores", {}).get("overallScore", 75)
-        if overall >= 80:
-            factors.append(("Sleep", f"{overall}/100", "+"))
-        elif overall >= 65:
-            score -= 15
-            factors.append(("Sleep", f"{overall}/100", "~"))
-        else:
-            score -= 30
-            factors.append(("Sleep", f"{overall}/100", "-"))
+    # Unwrap live API structure if needed
+        if "dailySleepDTO" in sleep:
+            sleep = sleep["dailySleepDTO"]
 
-        # Deep sleep specifically
-        deep_seconds = sleep.get("deepSleepSeconds", 0)
-        deep_mins = deep_seconds // 60
-        if deep_mins < 45:
-            score -= 10
-            factors.append(("Deep sleep", f"{deep_mins} min", "-"))
-        else:
-            factors.append(("Deep sleep", f"{deep_mins} min", "+"))
+    # Overall score — handle both API and export structure
+    overall = (
+        sleep.get("sleepScores", {})
+            .get("overall", {})
+            .get("value")
+        or sleep.get("sleepScores", {})
+            .get("overallScore")
+        or 75
+    )
+
+    if overall >= 80:
+        factors.append(("Sleep", f"{overall}/100", "+"))
+    elif overall >= 65:
+        score -= 15
+        factors.append(("Sleep", f"{overall}/100", "~"))
+    else:
+        score -= 30
+        factors.append(("Sleep", f"{overall}/100", "-"))
+
+    # Deep sleep
+    deep_seconds = sleep.get("deepSleepSeconds", 0)
+    deep_mins = deep_seconds // 60
+    if deep_mins < 45:
+        score -= 10
+        factors.append(("Deep sleep", f"{deep_mins} min", "-"))
+    else:
+        factors.append(("Deep sleep", f"{deep_mins} min", "+"))
 
     # Training load component (max 40 points impact)
     if training:
@@ -144,8 +217,10 @@ def generate_html(sleep, training, vo2max):
 
     # Sleep details
     if sleep:
+        if "dailySleepDTO" in sleep:
+            sleep = sleep["dailySleepDTO"]
         sleep_scores = sleep.get("sleepScores", {})
-        overall_sleep = sleep_scores.get("overallScore", "—")
+        overall_sleep = sleep_scores.get("overall", {}).get("value", "—")
         deep_mins = sleep.get("deepSleepSeconds", 0) // 60
         rem_mins = sleep.get("remSleepSeconds", 0) // 60
         light_mins = sleep.get("lightSleepSeconds", 0) // 60
@@ -161,8 +236,16 @@ def generate_html(sleep, training, vo2max):
         # Bedtime
         start = sleep.get("sleepStartTimestampGMT", "")
         if start:
-            dt = datetime.fromisoformat(start)
-            bedtime_str = dt.strftime("%-I:%M %p")
+            try:
+                if isinstance(start, (int, float)):
+                    # Live API returns milliseconds since epoch
+                    dt = datetime.fromtimestamp(start / 1000)
+                else:
+                    # Export data returns ISO string
+                    dt = datetime.fromisoformat(start)
+                bedtime_str = dt.strftime("%-I:%M %p")
+            except Exception:
+                bedtime_str = "—"
         else:
             bedtime_str = "—"
     else:
@@ -173,7 +256,7 @@ def generate_html(sleep, training, vo2max):
     # Training details
     if training:
         train_status = training.get("trainingStatus", "—").title()
-        fitness_trend = training.get("fitnessLevelTrend", "—").replace("_", " ").title()
+        fitness_trend = str(training.get("fitnessLevelTrend", "—"))
         weekly_load = training.get("weeklyTrainingLoadSum", "—")
         load_min = training.get("loadTunnelMin", "—")
         load_max = training.get("loadTunnelMax", "—")
@@ -446,25 +529,73 @@ def main():
     print(f"Building dashboard for {today}...")
 
     # Load all data
-    print("Loading sleep data...")
-    sleep_records = load_json_files(DATA_WELLNESS, "*sleepData*.json")
-    
-    print("Loading training data...")
-    training_records = load_json_files(DATA_METRICS, "TrainingHistory*.json")
-    
-    print("Loading VO2max data...")
-    vo2_records = load_json_files(DATA_METRICS, "MetricsMaxMetData*.json")
+  # Try live data first
+    live = get_live_data(today, yesterday)
 
-    # Get latest records
-    # Sleep: use yesterday's night (last night)
-    sleep = get_latest_record(sleep_records, "calendarDate", yesterday)
-    training = get_latest_record(training_records, "calendarDate", today)
-    vo2max = get_latest_record(vo2_records, "calendarDate", today)
+    if live:
+        # Use live API data
+        sleep = live.get("sleep")
+        training_raw = live.get("training_status")
+        body_battery = live.get("body_battery")
+        rhr = live.get("rhr")
 
-    print(f"  Sleep record: {sleep.get('calendarDate') if sleep else 'none found'}")
-    print(f"  Training record: {training.get('calendarDate') if training else 'none found'}")
-    print(f"  VO2max record: {vo2max.get('calendarDate') if vo2max else 'none found'}")
+        # Extract training status from nested live structure
+        if training_raw:
+            device_data = training_raw.get(
+                "mostRecentTrainingStatus", {}
+            ).get("latestTrainingStatusData", {})
+            
+            # Get first device's data
+            if device_data:
+                device_id = list(device_data.keys())[0]
+                ts = device_data[device_id]
+                training = {
+                    "trainingStatus": TRAINING_STATUS_MAP.get(
+                        ts.get("trainingStatus", 0), "Unknown"
+                    ),
+                    "weeklyTrainingLoadSum": ts.get("weeklyTrainingLoad", 0),
+                    "loadTunnelMin": ts.get("loadTunnelMin", 0),
+                    "loadTunnelMax": ts.get("loadTunnelMax", 0),
+                    "trainingStatusFeedbackPhrase": ts.get(
+                        "trainingStatusFeedbackPhrase", ""
+                    ),
+                    "fitnessLevelTrend": FITNESS_TREND_MAP.get(ts.get("fitnessTrend", 0), "Unknown")
+                }
+            else:
+                training = None
 
+        # Extract VO2max from training status response
+        vo2max = None
+        if training_raw:
+            vo2_data = training_raw.get("mostRecentVO2Max", {}).get("generic")
+            if vo2_data:
+                vo2max = {"vo2MaxValue": vo2_data.get("vo2MaxPreciseValue")}
+
+        # Extract current body battery level
+        bb_level = None
+        if body_battery and isinstance(body_battery, list):
+            bb_today = [b for b in body_battery if b.get("date") == today]
+            if bb_today:
+                vals = bb_today[0].get("bodyBatteryValuesArray", [])
+                if vals:
+                    bb_level = vals[-1][1]  # most recent value
+
+        print(f"  Body battery: {bb_level}")
+        print(f"  Training status: {training.get('trainingStatus') if training else 'none'}")
+
+    else:
+        # Fall back to export data
+        print("Using export data...")
+        sleep_records = load_json_files(DATA_WELLNESS, "*sleepData*.json")
+        training_records = load_json_files(DATA_METRICS, "TrainingHistory*.json")
+        vo2_records = load_json_files(DATA_METRICS, "MetricsMaxMetData*.json")
+
+        sleep = get_latest_record(sleep_records, "calendarDate", yesterday)
+        training = get_latest_record(training_records, "calendarDate", today)
+        vo2max = get_latest_record(vo2_records, "calendarDate", today)
+        bb_level = None
+        rhr = None
+        
     # Generate dashboard
     print("Generating dashboard...")
     html = generate_html(sleep, training, vo2max)
