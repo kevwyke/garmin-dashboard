@@ -111,7 +111,92 @@ def get_live_data(today, yesterday):
             print(f"  Could not fetch {name}: {e}")
             data[name] = None
 
-    return data
+    return data, garmin
+
+def get_weekly_strip_data(client):
+    """Fetch 7 days of sleep, body battery and activity data for the strip."""
+    today = date.today()
+    week_ago = (today - timedelta(days=6)).isoformat()
+    
+    strip = {}
+    
+    # Initialise 7 days as empty
+    for i in range(7):
+        d = (today - timedelta(days=6-i)).isoformat()
+        strip[d] = {
+            "date": d,
+            "sleep_score": None,
+            "sleep_seconds": None,
+            "morning_bb": None,
+            "charged": None,
+            "activities": [],
+            "total_load": 0
+        }
+    
+    # Sleep
+    print("  Fetching weekly sleep...")
+    for i in range(7):
+        d = (today - timedelta(days=6-i)).isoformat()
+        try:
+            sleep = client.get_sleep_data(d)
+            dto = sleep.get("dailySleepDTO", {})
+            strip[d]["sleep_score"] = (
+                dto.get("sleepScores", {})
+                   .get("overall", {})
+                   .get("value")
+            )
+            strip[d]["sleep_seconds"] = dto.get("sleepTimeSeconds", 0)
+        except Exception:
+            pass
+
+    # Body battery
+    print("  Fetching weekly body battery...")
+    for i in range(7):
+        d = (today - timedelta(days=6-i)).isoformat()
+        try:
+            bb = client.get_body_battery(d)
+            if bb and isinstance(bb, list):
+                day_data = [b for b in bb if b.get("date") == d]
+                if day_data:
+                    vals = day_data[0].get("bodyBatteryValuesArray", [])
+                    if vals:
+                        strip[d]["morning_bb"] = vals[0][1]
+                    strip[d]["charged"] = day_data[0].get("charged")
+        except Exception:
+            pass
+
+    # Activities
+    print("  Fetching weekly activities...")
+    try:
+        activities = client.get_activities_by_date(
+            week_ago, today.isoformat()
+        )
+        for a in activities:
+            d = a.get("startTimeLocal", "")[:10]
+            if d in strip:
+                activity_type = (
+                    a.get("activityType", {})
+                     .get("typeKey", "unknown")
+                )
+                load = a.get("activityTrainingLoad", 0) or 0
+                distance = round(
+                    a.get("distance", 0) / 1000, 1
+                )
+                strip[d]["activities"].append({
+                    "type": activity_type,
+                    "load": round(load),
+                    "distance": distance,
+                    "aerobic": a.get("aerobicTrainingEffect", 0)
+                })
+                strip[d]["total_load"] += load
+    except Exception as e:
+        print(f"  Could not fetch activities: {e}")
+
+    # Round total loads
+    for d in strip:
+        strip[d]["total_load"] = round(strip[d]["total_load"])
+
+    return strip
 
 # ── Readiness scoring ─────────────────────────────────────────────────────────
 
@@ -205,7 +290,22 @@ def format_duration(seconds):
     m = (seconds % 3600) // 60
     return f"{h}h {m:02d}m"
 
-def generate_html(sleep, training, vo2max):
+def activity_label(type_key):
+    """Convert Garmin activity type key to short display label."""
+    labels = {
+        "running":          "Run",
+        "indoor_cycling":   "Spin",
+        "cycling":          "Bike",
+        "road_cycling":     "Bike",
+        "pool_swimming":    "Swim",
+        "open_water_swimming": "OW Swim",
+        "strength_training": "Strength",
+        "cardio":           "Cardio",
+        "walking":          "Walk",
+    }
+    return labels.get(type_key, type_key.replace("_", " ").title())
+
+def generate_html(sleep, training, vo2max, weekly_strip=None):
     today = date.today()
     day_name = today.strftime("%A")
     date_str = today.strftime("%-d %B %Y")
@@ -273,6 +373,143 @@ def generate_html(sleep, training, vo2max):
 
     # VO2max
     vo2 = vo2max.get("vo2MaxValue", "—") if vo2max else "—"
+
+# 7-day strip
+    strip_html = ""
+    cumulative_load = 0
+    load_tunnel_min = training.get("loadTunnelMin", 360) if training else 360
+    load_tunnel_max = training.get("loadTunnelMax", 794) if training else 794
+
+    if weekly_strip:
+        for day_date, day in weekly_strip.items():
+            is_today = (day_date == today)
+            border = "border: 2px solid #378ADD;" if is_today else \
+                     "border: 0.5px solid #e0e0e0;"
+            bg = "#F0F7FF" if is_today else "white"
+
+            # Sleep bar
+            sleep_score = day.get("sleep_score") or 0
+            bar_height = max(4, int(sleep_score * 0.6))
+            if sleep_score >= 75:
+                bar_color = "#1D9E75"
+            elif sleep_score >= 60:
+                bar_color = "#EF9F27"
+            else:
+                bar_color = "#E24B4A"
+            bar_html = f"""
+                <div style="height:60px; display:flex; align-items:flex-end;
+                            justify-content:center; margin-bottom:4px;">
+                    <div style="width:28px; height:{bar_height}px;
+                                background:{bar_color};
+                                border-radius:3px 3px 0 0;">
+                    </div>
+                </div>"""
+
+            # Sleep score
+            score_str = str(sleep_score) if sleep_score else "—"
+
+            # Morning BB
+            bb = day.get("morning_bb")
+            bb_str = str(bb) if bb is not None else "—"
+            if bb is not None:
+                bb_color = "#1D9E75" if bb >= 50 else \
+                           "#EF9F27" if bb >= 30 else "#E24B4A"
+            else:
+                bb_color = "#aaa"
+
+            # Activities
+            activities = day.get("activities", [])
+            acts_html = ""
+            if activities:
+                for a in activities:
+                    act_label = activity_label(a["type"])
+                    dist = f" {a['distance']}km" if a["distance"] > 0 else ""
+                    acts_html += f"""
+                        <div style="font-size:10px; color:#555;
+                                    margin-bottom:2px;">
+                            {act_label}{dist}
+                        </div>"""
+            else:
+                acts_html = """
+                    <div style="font-size:10px; color:#ccc;">—</div>"""
+
+            # Day load
+            day_load = day.get("total_load", 0)
+            cumulative_load += day_load
+            load_str = str(day_load) if day_load > 0 else "—"
+
+            # Day name and date
+            dt = date.fromisoformat(day_date)
+            day_name = dt.strftime("%a")
+            day_num = dt.strftime("%-d")
+
+            strip_html += f"""
+            <div style="flex:1; {border} border-radius:8px;
+                        background:{bg}; padding:8px 4px;
+                        text-align:center; min-width:0;">
+                <div style="font-size:11px; font-weight:500;
+                            color:#999; margin-bottom:1px;">
+                    {day_name}
+                </div>
+                <div style="font-size:12px; color:#555;
+                            margin-bottom:6px;">
+                    {day_num}
+                </div>
+                {bar_html}
+                <div style="font-size:13px; font-weight:500;
+                            color:{bar_color}; margin-bottom:4px;">
+                    {score_str}
+                </div>
+                <div style="font-size:11px; color:#999;
+                            margin-bottom:2px;">BB</div>
+                <div style="font-size:13px; font-weight:500;
+                            color:{bb_color}; margin-bottom:6px;">
+                    {bb_str}
+                </div>
+                <div style="border-top:0.5px solid #eee;
+                            padding-top:6px; margin-bottom:4px;">
+                    {acts_html}
+                </div>
+                <div style="font-size:10px; color:#aaa;
+                            margin-bottom:1px;">load</div>
+                <div style="font-size:12px; font-weight:500;
+                            color:#555;">{load_str}</div>
+            </div>"""
+
+    # Cumulative load bar
+    load_pct = min(100, int(
+        (cumulative_load / load_tunnel_max) * 100
+    )) if load_tunnel_max else 0
+    tunnel_start_pct = int(
+        (load_tunnel_min / load_tunnel_max) * 100
+    ) if load_tunnel_max else 0
+
+    load_bar_html = f"""
+    <div style="margin-top:16px;">
+        <div style="display:flex; justify-content:space-between;
+                    font-size:11px; color:#999; margin-bottom:4px;">
+            <span>7-day cumulative load</span>
+            <span>{cumulative_load} 
+                  (range {load_tunnel_min}–{load_tunnel_max})</span>
+        </div>
+        <div style="background:#f0f0f0; border-radius:4px;
+                    height:8px; position:relative;">
+            <div style="position:absolute; left:{tunnel_start_pct}%;
+                        right:0; height:8px; background:#E6F1FB;
+                        border-radius:4px;">
+            </div>
+            <div style="position:absolute; left:0; width:{load_pct}%;
+                        height:8px; background:#378ADD;
+                        border-radius:4px;">
+            </div>
+        </div>
+        <div style="display:flex; justify-content:space-between;
+                    font-size:10px; color:#ccc; margin-top:3px;">
+            <span>0</span>
+            <span>optimal zone</span>
+            <span>{load_tunnel_max}</span>
+        </div>
+    </div>"""
 
     # Weekly schedule display
     days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -504,6 +741,15 @@ def generate_html(sleep, training, vo2max):
      if feedback_phrase and feedback_phrase != "—" else ""}
   </div>
 
+  <!-- 7-day strip -->
+  <div class="card">
+    <div class="section-title">Last 7 days</div>
+    <div style="display:flex; gap:6px; overflow:hidden;">
+      {strip_html}
+    </div>
+    {load_bar_html}
+  </div>
+
   <!-- Weekly schedule -->
   <div class="card">
     <div class="section-title">This week</div>
@@ -534,7 +780,7 @@ def main():
 
     # Load all data
   # Try live data first
-    live = get_live_data(today, yesterday)
+    live, garmin_client = get_live_data(today, yesterday)
 
     if live:
         # Use live API data
@@ -585,6 +831,8 @@ def main():
                     bb_level = vals[-1][1]  # most recent value
 
         print(f"  Body battery: {bb_level}")
+        print("Fetching weekly strip data...")
+        weekly_strip = get_weekly_strip_data(garmin_client)
         print(f"  Training status: {training.get('trainingStatus') if training else 'none'}")
 
     else:
@@ -602,7 +850,7 @@ def main():
         
     # Generate dashboard
     print("Generating dashboard...")
-    html = generate_html(sleep, training, vo2max)
+    html = generate_html(sleep, training, vo2max, weekly_strip)
 
     # Write file
     with open(OUTPUT_FILE, "w") as f:
